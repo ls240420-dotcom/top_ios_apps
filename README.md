@@ -1,6 +1,6 @@
 # Top iOS Apps Tracker
 
-Every day, this project pulls the **top 100 free iPhone apps (US App Store)** for every app category and every game subcategory, enriches each app with extra details, and writes the result to a **Google Sheet** (one new tab per day) plus a **CSV backup**. It also flags **newly added apps** and shows **rank movement within each category** compared with the previous snapshot.
+Every day, this project pulls the **top 200 free iPhone apps (US App Store)** for every app category and every game subcategory, enriches each app with extra details, and writes the result to a **Google Sheet** (one new tab per day) plus a **CSV backup**. It also flags **newly added apps** and shows **rank movement within each category** compared with the previous snapshot.
 
 It runs automatically on **GitHub Actions**, so once it's set up there is nothing to do day to day.
 
@@ -8,7 +8,7 @@ It runs automatically on **GitHub Actions**, so once it's set up there is nothin
 
 ## What you get
 
-- **40 charts per run:** 24 app categories and 16 game subcategories, 100 apps each.
+- **40 charts per run:** 24 app categories and 16 game subcategories, 200 apps each (Apple's feed maximum).
 - **One row per app** (merge mode, the default). Apps that appear in several charts are combined into a single row.
 - **A new Google Sheet tab each day**, named `top100_YYYY-MM-DD` (UTC date). A rerun on the same UTC day overwrites that day's tab.
 - **A CSV backup** (`ios_top100_all_categories.csv`), saved as a downloadable artifact on every workflow run for 30 days.
@@ -143,7 +143,7 @@ Settings are constants near the top of `ios_top100.py`:
 | Setting | Default | Notes |
 |---|---|---|
 | `CHART` | `topfreeapplications` | Or `toppaidapplications`, `topgrossingapplications` |
-| `LIMIT` | `100` | Apps per chart |
+| `LIMIT` | `200` | Apps per chart. Apple's feed caps at 200 |
 | `COUNTRY` | `us` | App Store country code |
 | `ENRICH` | `True` | `False` skips the Lookup API (faster, fewer columns) |
 | `INCLUDE_DESCRIPTIONS` | `False` | Adds long description text; makes output very large |
@@ -173,7 +173,9 @@ Running in Google Colab also works. If `GOOGLE_SERVICE_ACCOUNT_JSON` isn't set, 
 
 ## Notes and limits
 
-- **Sheet size:** each daily tab adds roughly 1,000 to 1,500 rows. Google Sheets caps a spreadsheet at 10 million cells, so archive old tabs or start a new spreadsheet after a year or so.
+- **Sheet size:** each daily tab has one row per unique app and about 30 columns. Google Sheets caps a spreadsheet at 10 million cells, so divide 10,000,000 by (rows in a tab × 30) to see how many days you have. At 200 apps per chart that can be only a couple of months, so archive old tabs or start a new spreadsheet before then.
 - **Cache:** the on-disk cache lives in `/tmp` and doesn't persist between GitHub runs. Retries within a single run still apply.
 - **Data source:** the chart data comes from Apple's public iTunes RSS feed and Lookup API. Charts are US top free and reflect Apple's own ranking.
+- **Naming:** tabs and the CSV keep the `top100` name even though the depth is now 200. Change tracking finds the previous tab by that name, so don't rename it.
+- **Changing `LIMIT`:** on the first run after changing the depth, apps in the newly added ranks are flagged `NEW` because yesterday's tab didn't include them. The next day's run is accurate.
 - **Formula safety:** the sheet is written in RAW mode, and CSV cells that start with `=`, `+`, `-` or `@` are neutralized, so app names can't run as formulas.
