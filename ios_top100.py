@@ -46,7 +46,7 @@ from datetime import date
 # Config
 # --------------------------------------------------------------------------
 CHART = "topfreeapplications"  # or "toppaidapplications", "topgrossingapplications"
-LIMIT = 200                    # Apple's RSS feed caps at 200
+LIMIT = 100                    # tested: Apple's RSS returns at most 100 per chart, even if you ask for 200
 COUNTRY = "us"
 ENRICH = True                  # False = skip Lookup API (faster, fewer fields)
 INCLUDE_DESCRIPTIONS = False   # full descriptions make the output very large
