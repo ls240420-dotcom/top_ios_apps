@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Top 100 free iPhone apps (US App Store) for every app category AND every game
-subcategory, written to Google Sheets (Colab) with a local CSV backup.
+subcategory, written to Google Sheets (Colab / GitHub Actions) with a local CSV backup.
 
 Pipeline
   1. Pull Apple's RSS top-chart for each genre (retries + on-disk cache).
   2. Enrich each unique app via Apple's Lookup API (retries).
-  3. Write a CSV (atomic) and then a Google Sheet.
+  3. Compare against the most recent earlier tab in the same Google Sheet
+     (newly_added + rank_change columns).
+  4. Write a CSV (atomic) and then a Google Sheet.
 
 Hardening vs. the original
   - Retries with exponential backoff + jitter, honors Retry-After on 429/503
@@ -20,6 +22,12 @@ DEDUPE_MODE:
   "merge":    one row per app. type / category comma-joined (best-ranked first),
               best_rank, chart_count, chart_appearances.
   "separate": one row per app per chart, with a plain `rank` column.
+
+Change-tracking columns (need a previous tab in the sheet; blank on the first run):
+  newly_added  "NEW" if the app was in none of the previous snapshot's charts.
+  rank_change  Movement within each category chart. POSITIVE = moved UP the chart.
+               merge:    "Apps > Utilities +3; Games > Puzzle -2; Games > Word NEW"
+               separate: a number (3, -2, 0) or "NEW" if it was not in this chart before.
 """
 
 import csv
@@ -43,6 +51,7 @@ COUNTRY = "us"
 ENRICH = True                  # False = skip Lookup API (faster, fewer fields)
 INCLUDE_DESCRIPTIONS = False   # full descriptions make the output very large
 DEDUPE_MODE = "merge"          # "merge" or "separate"
+TRACK_CHANGES = True           # newly_added + rank_change vs. the previous tab
 
 MAX_WORKERS = 3                # keep low to avoid rate limits
 MAX_RETRIES = 5
@@ -262,6 +271,7 @@ def merge_duplicates(rows):
         m["best_rank"] = charts[0][0]
         m["chart_count"] = len(charts)
         m["chart_appearances"] = "; ".join(f"{t} > {c} #{rk}" for rk, t, c in charts)
+        m["_appearances"] = charts   # kept for change tracking; never written out
 
     return out
 
@@ -332,12 +342,98 @@ def enrich(rows):
 
 
 # --------------------------------------------------------------------------
-# Step 3: output
+# Step 3: change tracking (newly_added + rank_change)
+# --------------------------------------------------------------------------
+TAB_RE = re.compile(r"^top100_(\d{4}-\d{2}-\d{2})$")
+APPEARANCE_RE = re.compile(r"(Apps|Games) > (.+?) #(\d+)")
+
+
+def load_previous(sh):
+    """Read the most recent earlier daily tab.
+
+    Returns (tab_date, {app_id: {(type, category): rank}}). Works with tabs written in
+    either DEDUPE_MODE. Returns (None, {}) if there is no earlier tab.
+    """
+    candidates = []
+    for ws in sh.worksheets():
+        m = TAB_RE.match(ws.title)
+        if m and m.group(1) < SNAPSHOT_DATE:   # ISO dates sort correctly as strings
+            candidates.append((m.group(1), ws))
+    if not candidates:
+        return None, {}
+
+    prev_date, ws = max(candidates, key=lambda c: c[0])
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return prev_date, {}
+
+    col = {h: i for i, h in enumerate(values[0])}
+    if "app_id" not in col:
+        log.warning("previous tab %s has no app_id column; skipping change tracking", ws.title)
+        return prev_date, {}
+
+    def cell(row, name):
+        i = col.get(name)
+        return row[i].strip() if i is not None and i < len(row) else ""
+
+    prev = {}
+    for row in values[1:]:
+        app_id = cell(row, "app_id")
+        if not app_id:
+            continue
+        ranks = prev.setdefault(app_id, {})
+        if "chart_appearances" in col:                      # merge-mode tab
+            for t, c, rk in APPEARANCE_RE.findall(cell(row, "chart_appearances")):
+                ranks[(t, c)] = int(rk)
+        elif cell(row, "rank").isdigit():                   # separate-mode tab
+            ranks[(cell(row, "type"), cell(row, "category"))] = int(cell(row, "rank"))
+    return prev_date, prev
+
+
+def _fmt_delta(d):
+    if d == "NEW":
+        return "NEW"
+    return f"{d:+d}" if d else "0"
+
+
+def apply_changes(rows, prev):
+    """Fill newly_added and rank_change on every row. Blank if there is no baseline.
+
+    rank_change = previous rank - current rank, so a positive number means the app
+    moved UP the chart (e.g. #5 -> #2 is +3).
+    """
+    for r in rows:
+        r["newly_added"] = ""
+        r["rank_change"] = ""
+    if not prev:
+        return
+
+    for r in rows:
+        if not r["app_id"]:
+            continue
+        old = prev.get(r["app_id"], {})
+        appearances = r.get("_appearances") or [(r["rank"], r["type"], r["category"])]
+
+        deltas = []
+        for rank, t, c in appearances:
+            was = old.get((t, c))
+            deltas.append((t, c, "NEW" if was is None else was - rank))
+
+        r["newly_added"] = "NEW" if not old else ""
+        if DEDUPE_MODE == "merge":
+            r["rank_change"] = "; ".join(f"{t} > {c} {_fmt_delta(d)}" for t, c, d in deltas)
+        else:
+            r["rank_change"] = deltas[0][2]   # an int, or "NEW"
+
+
+# --------------------------------------------------------------------------
+# Step 4: output
 # --------------------------------------------------------------------------
 def build_columns():
     rank_cols = (["best_rank", "chart_count", "chart_appearances"]
                  if DEDUPE_MODE == "merge" else ["rank"])
-    cols = (["app_name", "app_id", "type", "category"] + rank_cols +
+    change_cols = ["newly_added", "rank_change"]
+    cols = (["app_name", "app_id", "type", "category"] + rank_cols + change_cols +
             ["developer", "developer_url", "bundle_id", "app_url", "feed_release_date",
              "copyright", "icon_url", "summary", "snapshot_date"])
     if ENRICH:
@@ -365,7 +461,8 @@ def write_csv(rows, cols):
     log.info("Wrote %d rows, %d columns to %s", len(rows), len(cols), OUTPUT_FILE)
 
 
-def write_to_sheet(rows, cols):
+def open_spreadsheet():
+    """Authenticate and return (spreadsheet, created_flag)."""
     import gspread
 
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -393,6 +490,11 @@ def write_to_sheet(rows, cols):
             sh = gc.create(SPREADSHEET_TITLE)
             created = True
             log.info("Created new spreadsheet. Save this URL: %s", sh.url)
+    return sh, created
+
+
+def write_to_sheet(sh, created, rows, cols):
+    import gspread
 
     values = [cols] + [[r.get(c, "") for c in cols] for r in rows]
 
@@ -451,21 +553,44 @@ def main():
 
     missing_lookup = enrich(rows) if ENRICH else 0
 
+    # Connect to the sheet once: needed to read the previous tab AND to write today's.
+    sh, created = None, False
+    if WRITE_TO_SHEET:
+        try:
+            sh, created = open_spreadsheet()
+        except Exception as e:
+            log.error("Could not open Google Sheet (CSV backup will still be saved): %s", e)
+
+    prev, prev_date = {}, None
+    if TRACK_CHANGES and sh is not None:
+        try:
+            prev_date, prev = load_previous(sh)
+            if prev:
+                log.info("Comparing against previous snapshot %s (%d apps)", prev_date, len(prev))
+            else:
+                log.info("No previous snapshot found; change columns left blank")
+        except Exception as e:
+            log.warning("Could not read previous snapshot (%s); change columns left blank", e)
+    apply_changes(rows, prev)
+
     cols = build_columns()
     write_csv(rows, cols)  # always write the local backup first
 
     sheet_url = None
-    if WRITE_TO_SHEET:
+    if sh is not None:
         try:
-            sheet_url = write_to_sheet(rows, cols)
+            sheet_url = write_to_sheet(sh, created, rows, cols)
         except Exception as e:
             log.error("Google Sheets write failed (CSV backup is still saved): %s", e)
 
     # ---- Summary -----------------------------------------------------------
+    new_count = sum(1 for r in rows if r.get("newly_added") == "NEW")
     print("\n" + "=" * 60)
     print(f"Snapshot {SNAPSHOT_DATE} | {COUNTRY.upper()} | {CHART} | limit {LIMIT}")
     print(f"Charts requested: {len(JOBS)} | failed: {len(failed)} | short: {len(short)}")
     print(f"Rows written: {len(rows)} | rows without Lookup data: {missing_lookup}")
+    if prev:
+        print(f"Compared to {prev_date}: {new_count} newly added apps")
     for label, err in failed:
         print(f"  FAILED: {label} -> {err}")
     for label, n in short:
