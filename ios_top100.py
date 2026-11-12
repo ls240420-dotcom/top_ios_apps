@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Top 100 free iPhone apps (US App Store) for every app category AND every game
+Top free iPhone apps (US App Store, LIMIT per chart) for every app category AND every game
 subcategory, written to Google Sheets (Colab / GitHub Actions) with a local CSV backup.
 
 Pipeline
@@ -46,7 +46,7 @@ from datetime import date
 # Config
 # --------------------------------------------------------------------------
 CHART = "topfreeapplications"  # or "toppaidapplications", "topgrossingapplications"
-LIMIT = 100
+LIMIT = 200                    # Apple's RSS feed caps at 200
 COUNTRY = "us"
 ENRICH = True                  # False = skip Lookup API (faster, fewer fields)
 INCLUDE_DESCRIPTIONS = False   # full descriptions make the output very large
